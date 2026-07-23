@@ -1,8 +1,11 @@
 # fit_sisr_rebut.py
 import argparse
+import fcntl
 import os
 import random
 import math
+import tempfile
+from datetime import datetime, timezone
 
 import lpips
 import matplotlib.pyplot as plt
@@ -22,7 +25,15 @@ from optims.lr_inc import SingleDeviceFinalIncWithAuxAdam
 from optims.lr_sign import SingleDeviceSignWithAuxAdam
 from optims.lr_svd import SingleDeviceLrSVDWithAuxAdam
 
-from optims.auto_cos_inc_rank import SingleDeviceAutoCosIncWithAuxAdam
+from rank_schedule_variants import (
+    SingleDeviceCosineDecWithAuxAdam,
+    SingleDeviceCosineIncWithAuxAdam,
+    SingleDeviceExponentialIncWithAuxAdam,
+    SingleDeviceFixedRankWithAuxAdam,
+    SingleDeviceLinearIncWithAuxAdam,
+    SingleDeviceLogarithmicIncWithAuxAdam,
+    SingleDeviceLogisticIncWithAuxAdam,
+)
 
 from models import (
     GaussFFN,
@@ -147,8 +158,21 @@ def create_comparison_image(gt_img, recon_img, epoch, psnr_val, ssim_val, lpips_
 
 
 def get_output_dir(args):
+    if args.output_dir is not None:
+        output_dir = os.path.abspath(args.output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        return output_dir
+
     base_dir = args.folder_name if args.folder_name is not None else 'results'
-    output_dir = os.path.join(base_dir, args.model, args.optimizer)
+    image_stem = os.path.splitext(os.path.basename(args.image))[0]
+    output_dir = os.path.join(
+        base_dir,
+        args.experiment_name,
+        args.dataset_split,
+        args.model,
+        args.optimizer,
+        image_stem,
+    )
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
@@ -187,12 +211,197 @@ def save_metrics_csv(metrics, layer_metrics, log_records, output_dir):
     if log_records:
         log_df = pd.DataFrame(log_records)
         log_df.to_csv(os.path.join(output_dir, 'train_log.csv'), index=False)
+        log_df.to_csv(os.path.join(output_dir, 'training_metrics.csv'), index=False)
 
     if layer_metrics:
         layer_df = pd.DataFrame({'Epoch': metrics['epochs']})
         for key, values in layer_metrics.items():
             layer_df[key] = values
         layer_df.to_csv(os.path.join(output_dir, 'layer_metrics.csv'), index=False)
+
+
+def _atomic_write_dataframe(dataframe, path):
+    """Atomically replace a CSV so concurrent readers never see a partial file."""
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=f'.{os.path.basename(path)}.',
+        suffix='.tmp',
+        dir=os.path.dirname(path),
+    )
+    os.close(fd)
+    try:
+        dataframe.to_csv(temporary_path, index=False)
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def make_run_id(args):
+    if args.run_id:
+        return args.run_id
+
+    image_stem = os.path.splitext(os.path.basename(args.image))[0]
+    fields = [
+        args.experiment_name,
+        args.dataset_split,
+        image_stem,
+        args.task,
+        f'x{args.scale_factor}',
+        args.model,
+        args.optimizer,
+        args.scheduler,
+        f'rf{args.rank}',
+        f'rs{args.rank_start}',
+        f're{args.rank_end}',
+        f'rw{args.rank_warmup_steps}',
+        f'ep{args.epochs}',
+        f'seed{args.seed}',
+    ]
+    return '__'.join(str(value).replace(os.sep, '-') for value in fields)
+
+
+def _write_condition_summary(results_df, summary_csv):
+    group_columns = [
+        'experiment_name',
+        'dataset_split',
+        'task',
+        'scale_factor',
+        'model',
+        'num_layers',
+        'hidden_dim',
+        'optimizer',
+        'rank_schedule',
+        'rank_direction',
+        'scheduler',
+        'epochs',
+        'seed',
+        'rank_floor',
+        'rank_start',
+        'rank_end',
+        'rank_warmup_steps',
+        'rank_wsd_warmup_steps',
+        'rank_wsd_decay_start_step',
+        'rank_wsd_min_lr_ratio',
+        'lr_aux',
+        'lr_muon',
+        'muon_momentum',
+        'muon_ns_steps',
+        'exp_rate',
+        'log_rate',
+        'logistic_steepness',
+    ]
+    group_columns = [column for column in group_columns if column in results_df.columns]
+    metric_columns = [
+        column
+        for column in ('final_psnr', 'final_ssim', 'final_lpips')
+        if column in results_df.columns
+    ]
+    if not group_columns or not metric_columns:
+        return
+
+    grouped = results_df.groupby(group_columns, dropna=False)
+    summary = grouped.size().rename('image_count').to_frame()
+    for metric in metric_columns:
+        numeric_metric = pd.to_numeric(results_df[metric], errors='coerce')
+        metric_frame = results_df[group_columns].copy()
+        metric_frame[metric] = numeric_metric
+        metric_group = metric_frame.groupby(group_columns, dropna=False)[metric]
+        summary[f'{metric}_mean'] = metric_group.mean()
+        summary[f'{metric}_std'] = metric_group.std(ddof=0)
+        summary[f'{metric}_min'] = metric_group.min()
+        summary[f'{metric}_max'] = metric_group.max()
+
+    _atomic_write_dataframe(summary.reset_index(), summary_csv)
+
+
+def upsert_aggregate_results(result_row, results_csv, summary_csv):
+    """Lock, upsert by run_id, and refresh the per-condition summary."""
+    if results_csv is None:
+        return
+
+    results_csv = os.path.abspath(results_csv)
+    os.makedirs(os.path.dirname(results_csv), exist_ok=True)
+    lock_path = f'{results_csv}.lock'
+
+    with open(lock_path, 'a+', encoding='utf-8') as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            if os.path.exists(results_csv) and os.path.getsize(results_csv) > 0:
+                aggregate = pd.read_csv(results_csv)
+            else:
+                aggregate = pd.DataFrame()
+
+            if 'run_id' in aggregate.columns:
+                aggregate = aggregate[
+                    aggregate['run_id'].astype(str) != str(result_row['run_id'])
+                ]
+            aggregate = pd.concat(
+                [aggregate, pd.DataFrame([result_row])],
+                ignore_index=True,
+                sort=False,
+            )
+            if 'run_id' in aggregate.columns:
+                aggregate = aggregate.sort_values('run_id').reset_index(drop=True)
+
+            _atomic_write_dataframe(aggregate, results_csv)
+            if summary_csv is not None:
+                _write_condition_summary(aggregate, os.path.abspath(summary_csv))
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def build_result_row(args, output_dir, final_metrics, final_rank_state):
+    image_path = os.path.abspath(args.image)
+    return {
+        'run_id': make_run_id(args),
+        'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+        'experiment_name': args.experiment_name,
+        'dataset_split': args.dataset_split,
+        'image_name': os.path.basename(image_path),
+        'image_path': image_path,
+        'task': args.task,
+        'scale_factor': args.scale_factor,
+        'epochs': args.epochs,
+        'seed': args.seed,
+        'model': args.model,
+        'num_layers': args.num_layers,
+        'hidden_dim': args.hidden_dim,
+        'optimizer': args.optimizer,
+        'rank_schedule': getattr(args, 'rank_schedule', None),
+        'rank_direction': getattr(args, 'rank_direction', None),
+        'scheduler': args.scheduler,
+        'lr_aux': args.lr,
+        'lr_muon': args.muon_lr,
+        'muon_momentum': args.muon_momentum,
+        'muon_ns_steps': args.muon_ns_steps,
+        'rank_floor': args.rank,
+        'rank_start': args.rank_start,
+        'rank_end': args.rank_end,
+        'rank_warmup_steps': args.rank_warmup_steps,
+        'final_applied_rank': final_rank_state.get('current_rank'),
+        'final_target_rank': final_rank_state.get('current_target_rank'),
+        'rank_wsd_warmup_steps': args.rank_wsd_warmup_steps,
+        'rank_wsd_decay_start_step': args.rank_wsd_decay_start_step,
+        'rank_wsd_min_lr_ratio': args.rank_wsd_min_lr_ratio,
+        'exp_rate': args.exp_rate,
+        'log_rate': args.log_rate,
+        'logistic_steepness': args.logistic_steepness,
+        'final_psnr': final_metrics['final_psnr'],
+        'final_ssim': final_metrics['final_ssim'],
+        'final_lpips': final_metrics['final_lpips'],
+        'output_dir': os.path.abspath(output_dir),
+        'predicted_image': os.path.join(os.path.abspath(output_dir), 'predicted_image.png'),
+    }
+
+
+def save_final_results(args, output_dir, result_row):
+    _atomic_write_dataframe(
+        pd.DataFrame([result_row]),
+        os.path.join(output_dir, 'final_result.csv'),
+    )
+    upsert_aggregate_results(result_row, args.results_csv, args.summary_csv)
 
 
 def modcrop(img, scale):
@@ -319,281 +528,310 @@ def build_model(args, c):
     return model
 
 
-AUTO_COS_INC_CANONICAL_NAME = 'auto_cos_inc'
-AUTO_COS_INC_OPTIMIZER_ALIASES = {
-    'auto_cos_inc',
-    'auto-cos-inc',
-    'auto_cos_inc_rank',
-    'auto-cos-inc-rank',
-    'lr-sign10-rsclF',
+RANK_SCHEDULE_OPTIMIZER_SPECS = {
+    'auto_cos_inc': {
+        'optimizer_class': SingleDeviceCosineIncWithAuxAdam,
+        'schedule': 'cosine',
+        'direction': 'increase',
+        'default_rank_start': 200,
+        'default_rank_end': 250,
+    },
+    'auto_exp_inc': {
+        'optimizer_class': SingleDeviceExponentialIncWithAuxAdam,
+        'schedule': 'exponential',
+        'direction': 'increase',
+        'default_rank_start': 200,
+        'default_rank_end': 250,
+    },
+    'auto_log_inc': {
+        'optimizer_class': SingleDeviceLogarithmicIncWithAuxAdam,
+        'schedule': 'logarithmic',
+        'direction': 'increase',
+        'default_rank_start': 200,
+        'default_rank_end': 250,
+    },
+    'auto_linear_inc': {
+        'optimizer_class': SingleDeviceLinearIncWithAuxAdam,
+        'schedule': 'linear',
+        'direction': 'increase',
+        'default_rank_start': 200,
+        'default_rank_end': 250,
+    },
+    'auto_logistic_inc': {
+        'optimizer_class': SingleDeviceLogisticIncWithAuxAdam,
+        'schedule': 'logistic',
+        'direction': 'increase',
+        'default_rank_start': 200,
+        'default_rank_end': 250,
+    },
+    'auto_cos_dec': {
+        'optimizer_class': SingleDeviceCosineDecWithAuxAdam,
+        'schedule': 'cosine',
+        'direction': 'decrease',
+        'default_rank_start': 250,
+        'default_rank_end': 200,
+    },
+    'auto_fixed': {
+        'optimizer_class': SingleDeviceFixedRankWithAuxAdam,
+        'schedule': 'fixed',
+        'direction': 'fixed',
+        'default_rank_start': 200,
+        'default_rank_end': 200,
+    },
+}
+RANK_SCHEDULE_OPTIMIZER_NAMES = set(RANK_SCHEDULE_OPTIMIZER_SPECS)
+RANK_SCHEDULE_OPTIMIZER_ALIASES = {
+    'auto_cos_inc': 'auto_cos_inc',
+    'auto-cos-inc': 'auto_cos_inc',
+    'auto_cos_inc_rank': 'auto_cos_inc',
+    'auto-cos-inc-rank': 'auto_cos_inc',
+    'cosine_inc': 'auto_cos_inc',
+    'lr-sign10-rsclF': 'auto_cos_inc',
+    'auto_exp_inc': 'auto_exp_inc',
+    'auto-exp-inc': 'auto_exp_inc',
+    'auto_exp_inc_rank': 'auto_exp_inc',
+    'auto-exp-inc-rank': 'auto_exp_inc',
+    'exp_inc': 'auto_exp_inc',
+    'auto_log_inc': 'auto_log_inc',
+    'auto-log-inc': 'auto_log_inc',
+    'auto_log_inc_rank': 'auto_log_inc',
+    'auto-log-inc-rank': 'auto_log_inc',
+    'log_inc': 'auto_log_inc',
+    'auto_linear_inc': 'auto_linear_inc',
+    'auto-linear-inc': 'auto_linear_inc',
+    'auto_linear_inc_rank': 'auto_linear_inc',
+    'auto-linear-inc-rank': 'auto_linear_inc',
+    'linear_inc': 'auto_linear_inc',
+    'auto_logistic_inc': 'auto_logistic_inc',
+    'auto-logistic-inc': 'auto_logistic_inc',
+    'auto_logistic_inc_rank': 'auto_logistic_inc',
+    'auto-logistic-inc-rank': 'auto_logistic_inc',
+    'logistic_inc': 'auto_logistic_inc',
+    'auto_cos_dec': 'auto_cos_dec',
+    'auto-cos-dec': 'auto_cos_dec',
+    'auto_cos_dec_rank': 'auto_cos_dec',
+    'auto-cos-dec-rank': 'auto_cos_dec',
+    'cosine_dec': 'auto_cos_dec',
+    'auto_fixed': 'auto_fixed',
+    'auto-fixed': 'auto_fixed',
+    'auto_fixed_rank': 'auto_fixed',
+    'auto-fixed-rank': 'auto_fixed',
+    'fixed_rank': 'auto_fixed',
 }
 LOWRANK_OPTIMIZER_NAMES = {'lr-inc', 'lr-sign', 'lr-svd'}
-LOWRANK_LIKE_OPTIMIZERS = {'muon'} | LOWRANK_OPTIMIZER_NAMES | {AUTO_COS_INC_CANONICAL_NAME}
+LOWRANK_LIKE_OPTIMIZERS = {
+    'muon',
+    *LOWRANK_OPTIMIZER_NAMES,
+    *RANK_SCHEDULE_OPTIMIZER_NAMES,
+}
 
 
 def normalize_optimizer_name(name):
-    if name in AUTO_COS_INC_OPTIMIZER_ALIASES:
-        return AUTO_COS_INC_CANONICAL_NAME
-    return name
+    """Map file-style and legacy aliases to a canonical optimizer name."""
+    return RANK_SCHEDULE_OPTIMIZER_ALIASES.get(name, name)
 
 
-def resolve_auto_cos_inc_rank_args(args):
-    """Resolve and validate rank-growth arguments for auto_cos_inc_rank.py."""
+def resolve_rank_schedule_args(args):
+    """Resolve endpoints and validate the selected rank_schedule_variants optimizer."""
+    if args.optimizer not in RANK_SCHEDULE_OPTIMIZER_NAMES:
+        args.rank_schedule = None
+        args.rank_direction = None
+        return
+
+    spec = RANK_SCHEDULE_OPTIMIZER_SPECS[args.optimizer]
+    args.rank_schedule = spec['schedule']
+    args.rank_direction = spec['direction']
+
     if args.rank <= 0:
         raise ValueError('--rank must be > 0.')
     if args.rank_start is None:
-        args.rank_start = int(args.rank)
+        if spec['direction'] in {'increase', 'fixed'}:
+            args.rank_start = int(args.rank)
+        else:
+            args.rank_start = int(spec['default_rank_start'])
     if args.rank_end is None:
-        args.rank_end = int(args.rank_start)
+        if spec['direction'] == 'fixed':
+            args.rank_end = int(args.rank_start)
+        else:
+            args.rank_end = int(spec['default_rank_end'])
 
     args.rank_start = int(args.rank_start)
     args.rank_end = int(args.rank_end)
-
-    if args.rank_start <= 0:
-        raise ValueError('--rank_start must be > 0 when provided.')
-    if args.rank_end <= 0:
-        raise ValueError('--rank_end must be > 0 when provided.')
-    if args.rank_end < args.rank_start:
-        raise ValueError('--rank_end must be >= --rank_start for cosine rank growth.')
+    if args.rank_start <= 0 or args.rank_end <= 0:
+        raise ValueError('--rank_start and --rank_end must be > 0.')
+    if spec['direction'] == 'increase' and args.rank_end < args.rank_start:
+        raise ValueError(
+            f"{args.optimizer} requires --rank_end >= --rank_start; "
+            f"got {args.rank_start} -> {args.rank_end}."
+        )
+    if spec['direction'] == 'decrease' and args.rank_start < args.rank_end:
+        raise ValueError(
+            f"{args.optimizer} requires --rank_start >= --rank_end; "
+            f"got {args.rank_start} -> {args.rank_end}."
+        )
+    if spec['direction'] == 'fixed' and args.rank_start != args.rank_end:
+        raise ValueError(
+            f"{args.optimizer} requires --rank_start == --rank_end; "
+            f"got {args.rank_start} and {args.rank_end}."
+        )
 
     if args.rank_warmup_steps is None:
         if args.scheduler == 'rank_wsd':
-            if args.rank_wsd_decay_start_step is None:
-                args.rank_warmup_steps = max(1, int(round(0.8 * args.epochs)))
-            else:
-                args.rank_warmup_steps = max(1, int(args.rank_wsd_decay_start_step))
+            decay_start = args.rank_wsd_decay_start_step
+            if decay_start is None:
+                decay_start = round(0.8 * args.epochs)
+            args.rank_warmup_steps = max(1, int(decay_start))
         else:
             args.rank_warmup_steps = max(1, int(args.epochs))
     else:
         args.rank_warmup_steps = int(args.rank_warmup_steps)
 
     if args.rank_warmup_steps <= 0:
-        raise ValueError('--rank_warmup_steps must be > 0 when provided.')
+        raise ValueError('--rank_warmup_steps must be > 0.')
     if args.rank_oversample < 0:
         raise ValueError('--rank_oversample must be >= 0.')
     if args.muon_ns_steps <= 0:
         raise ValueError('--muon_ns_steps must be > 0.')
     if not (0.0 < args.init_energy <= 1.0):
         raise ValueError('--init_energy must be in (0, 1].')
-    if args.init_probe_steps <= 0:
-        raise ValueError('--init_probe_steps must be > 0.')
-    if args.init_round_multiple <= 0:
-        raise ValueError('--init_round_multiple must be > 0.')
+    if args.init_probe_steps <= 0 or args.init_round_multiple <= 0:
+        raise ValueError('--init_probe_steps and --init_round_multiple must be > 0.')
+    if args.exp_rate <= 0.0 or args.log_rate <= 0.0:
+        raise ValueError('--exp_rate and --log_rate must be > 0.')
+    if args.logistic_steepness <= 0.0:
+        raise ValueError('--logistic_steepness must be > 0.')
+    if args.auto_init_rank_start and spec['direction'] != 'increase':
+        raise ValueError(
+            '--auto_init_rank_start is supported only by increasing-rank variants.'
+        )
+    if args.rank_start < args.rank or args.rank_end < args.rank:
+        print(
+            'WARNING: the optimizer applies max(--rank, scheduled_rank); '
+            'a boundary below --rank will be floored.'
+        )
 
-    if args.rank_start < args.rank:
+    print(
+        f"INFO: {args.optimizer} uses {args.rank_schedule} rank "
+        f"{args.rank_direction}: {args.rank_start} -> {args.rank_end}, "
+        f"rank floor={args.rank}, rank steps={args.rank_warmup_steps}."
+    )
+
+
+def split_matrix_and_aux_params(args, model):
+    matrix_params = []
+    other_params = []
+    first_layer_matrix_models = {'relu_ffn', 'gauss_ffn', 'relu_pos_enc'}
+    is_special_model = args.model in first_layer_matrix_models
+
+    if not hasattr(model, 'mlp') or not isinstance(model.mlp, torch.nn.Sequential):
         print(
-            'WARNING: --rank_start is smaller than --rank. '
-            'auto_cos_inc_rank.py floors the applied rank by --rank, so the effective start rank will be --rank.'
+            "WARNING: Model does not have a standard 'mlp' attribute. "
+            "Cannot identify matrix-optimizer parameters."
         )
-    if args.rank_end < args.rank:
-        print(
-            'WARNING: --rank_end is smaller than --rank. '
-            'auto_cos_inc_rank.py will floor every applied rank by --rank; rank growth will be disabled.'
-        )
+        return matrix_params, list(model.parameters())
+
+    num_mlp_layers = len(model.mlp)
+    for name, param in model.named_parameters():
+        is_matrix_target = False
+        if 'mlp' in name and 'weight' in name and param.ndim >= 2:
+            try:
+                layer_idx = int(name.split('.')[1])
+                is_hidden_layer = 0 < layer_idx < num_mlp_layers - 1
+                is_selected_first_layer = (
+                    is_special_model
+                    and args.optimize_first_layer_with_muon
+                    and layer_idx == 0
+                )
+                is_matrix_target = is_hidden_layer or is_selected_first_layer
+            except (ValueError, IndexError):
+                pass
+
+        if is_matrix_target:
+            matrix_params.append(param)
+        else:
+            other_params.append(param)
+
+    return matrix_params, other_params
 
 
 def build_optimizer(args, model):
-    """
-    This optimizer construction intentionally mirrors fit_image_optim_modified.py.
-    The only goal here is optimizer parity between overfitting and SISR runs.
-    """
-    if args.optimizer == 'muon':
-        print("INFO: Setting up Muon optimizer.")
-        muon_params = []
-        other_params = []
-
-        first_layer_muon_models = {'relu_ffn', 'gauss_ffn', 'relu_pos_enc'}
-        is_special_model = args.model in first_layer_muon_models
-
-        if hasattr(model, 'mlp') and isinstance(model.mlp, torch.nn.Sequential):
-            num_mlp_layers = len(model.mlp)
-
-            for name, param in model.named_parameters():
-                is_muon_target = False
-
-                if 'mlp' in name and 'weight' in name and param.ndim >= 2:
-                    try:
-                        layer_idx = int(name.split('.')[1])
-
-                        is_hidden_layer = 0 < layer_idx < num_mlp_layers - 1
-                        is_first_layer_for_muon = (
-                            is_special_model
-                            and args.optimize_first_layer_with_muon
-                            and layer_idx == 0
-                        )
-
-                        if is_hidden_layer or is_first_layer_for_muon:
-                            is_muon_target = True
-
-                    except (ValueError, IndexError):
-                        pass
-
-                if is_muon_target:
-                    muon_params.append(param)
-                else:
-                    other_params.append(param)
-        else:
-            print("WARNING: Model does not have a standard 'mlp' attribute. Cannot separate params for Muon.")
-            other_params = list(model.parameters())
-
-        if muon_params:
-            if is_special_model and args.optimize_first_layer_with_muon:
-                print(
-                    "INFO: --optimize_first_layer_with_muon=True. "
-                    "The first MLP layer will also be optimized by Muon."
-                )
-
-            param_groups = [
-                dict(
-                    params=muon_params,
-                    use_muon=True,
-                    lr=args.muon_lr,
-                    weight_decay=args.muon_weight_decay,
-                ),
-                dict(
-                    params=other_params,
-                    use_muon=False,
-                    lr=args.lr,
-                    betas=(0.9, 0.999),
-                    weight_decay=args.muon_aux_weight_decay,
-                ),
-            ]
-
-            optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
-            print(
-                f"INFO: Muon optimizer configured. "
-                f"Muon params: {len(muon_params)}, Other params: {len(other_params)}."
-            )
-
-        else:
+    if args.optimizer in LOWRANK_LIKE_OPTIMIZERS:
+        matrix_params, other_params = split_matrix_and_aux_params(args, model)
+        if not matrix_params:
             raise ValueError(
-                f"Muon optimizer was selected (model: {args.model}), but no suitable "
-                f"parameters were identified for Muon."
-            )
-    elif args.optimizer in LOWRANK_OPTIMIZER_NAMES or args.optimizer == AUTO_COS_INC_CANONICAL_NAME:
-        print("INFO: Setting up lowrank-* optimizer.")
-        muon_params = []
-        other_params = []
-
-        first_layer_muon_models = {'relu_ffn', 'gauss_ffn', 'relu_pos_enc'}
-        is_special_model = args.model in first_layer_muon_models
-
-        if hasattr(model, 'mlp') and isinstance(model.mlp, torch.nn.Sequential):
-            num_mlp_layers = len(model.mlp)
-
-            for name, param in model.named_parameters():
-                is_muon_target = False
-
-                if 'mlp' in name and 'weight' in name and param.ndim >= 2:
-                    try:
-                        layer_idx = int(name.split('.')[1])
-
-                        is_hidden_layer = 0 < layer_idx < num_mlp_layers - 1
-                        is_first_layer_for_muon = (
-                            is_special_model
-                            and args.optimize_first_layer_with_muon
-                            and layer_idx == 0
-                        )
-
-                        if is_hidden_layer or is_first_layer_for_muon:
-                            is_muon_target = True
-
-                    except (ValueError, IndexError):
-                        pass
-
-                if is_muon_target:
-                    muon_params.append(param)
-                else:
-                    other_params.append(param)
-        else:
-            print("WARNING: Model does not have a standard 'mlp' attribute. Cannot separate params for Muon.")
-            other_params = list(model.parameters())
-
-        if muon_params:
-            if is_special_model and args.optimize_first_layer_with_muon:
-                print(
-                    "INFO: --optimize_first_layer_with_muon=True. "
-                    "The first MLP layer will also be optimized by Muon."
-                )
-
-            param_groups = [
-                dict(
-                    params=muon_params,
-                    use_muon=True,
-                    lr=args.muon_lr,
-                    weight_decay=args.muon_weight_decay,
-                ),
-                dict(
-                    params=other_params,
-                    use_muon=False,
-                    lr=args.lr,
-                    betas=(0.9, 0.999),
-                    weight_decay=args.muon_aux_weight_decay,
-                ),
-            ]
-
-            if args.optimizer == AUTO_COS_INC_CANONICAL_NAME:
-                param_groups[0].update(
-                    momentum=args.muon_momentum,
-                    ns_steps=args.muon_ns_steps,
-                    nesterov=not args.muon_no_nesterov,
-                    rank=args.rank,
-                    rank_start=args.rank_start,
-                    rank_end=args.rank_end,
-                    warmup_steps=args.rank_warmup_steps,
-                    oversample=args.rank_oversample,
-                    lowrank_rescale=args.lowrank_rescale,
-                    eps=args.lowrank_eps,
-                    small_ns_bfloat16=args.small_ns_bfloat16,
-                    auto_init_rank_start=args.auto_init_rank_start,
-                    init_probe_steps=args.init_probe_steps,
-                    init_energy=args.init_energy,
-                    init_round_multiple=args.init_round_multiple,
-                )
-
-            if args.optimizer == 'lr-inc':
-                optimizer = SingleDeviceFinalIncWithAuxAdam(param_groups)
-                optimizer_name = 'lr-inc'
-            elif args.optimizer == 'lr-sign':
-                optimizer = SingleDeviceSignWithAuxAdam(param_groups)
-                optimizer_name = 'lr-sign'
-            elif args.optimizer == 'lr-svd':
-                optimizer = SingleDeviceLrSVDWithAuxAdam(param_groups)
-                optimizer_name = 'lr-svd'
-            elif args.optimizer == AUTO_COS_INC_CANONICAL_NAME:
-                optimizer = SingleDeviceAutoCosIncWithAuxAdam(param_groups)
-                optimizer_name = AUTO_COS_INC_CANONICAL_NAME
-            else:
-                optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
-                optimizer_name = args.optimizer
-            print(
-                f"INFO: {optimizer_name} optimizer configured. "
-                f"Muon params: {len(muon_params)}, Other params: {len(other_params)}."
+                f"{args.optimizer} was selected (model: {args.model}), but no "
+                "suitable weight matrices were identified."
             )
 
-        else:
-            raise ValueError(
-                f"Muon optimizer was selected (model: {args.model}), but no suitable "
-                f"parameters were identified for Muon."
+        param_groups = [
+            dict(
+                params=matrix_params,
+                use_muon=True,
+                lr=args.muon_lr,
+                weight_decay=args.muon_weight_decay,
+            ),
+            dict(
+                params=other_params,
+                use_muon=False,
+                lr=args.lr,
+                betas=(0.9, 0.999),
+                weight_decay=args.muon_aux_weight_decay,
+            ),
+        ]
+        if args.optimizer in RANK_SCHEDULE_OPTIMIZER_NAMES:
+            param_groups[0].update(
+                momentum=args.muon_momentum,
+                ns_steps=args.muon_ns_steps,
+                nesterov=not args.muon_no_nesterov,
+                rank=args.rank,
+                rank_start=args.rank_start,
+                rank_end=args.rank_end,
+                warmup_steps=args.rank_warmup_steps,
+                oversample=args.rank_oversample,
+                lowrank_rescale=args.lowrank_rescale,
+                eps=args.lowrank_eps,
+                small_ns_bfloat16=args.small_ns_bfloat16,
+                auto_init_rank_start=args.auto_init_rank_start,
+                init_probe_steps=args.init_probe_steps,
+                init_energy=args.init_energy,
+                init_round_multiple=args.init_round_multiple,
+                rank_schedule=args.rank_schedule,
+                exp_rate=args.exp_rate,
+                log_rate=args.log_rate,
+                logistic_steepness=args.logistic_steepness,
             )
 
-    elif args.optimizer == 'lbfgs':
-        print("INFO: Using L-BFGS optimizer.")
-        optimizer = optim.LBFGS(
+        optimizer_classes = {
+            'muon': SingleDeviceMuonWithAuxAdam,
+            'lr-inc': SingleDeviceFinalIncWithAuxAdam,
+            'lr-sign': SingleDeviceSignWithAuxAdam,
+            'lr-svd': SingleDeviceLrSVDWithAuxAdam,
+        }
+        optimizer_classes.update({
+            name: spec['optimizer_class']
+            for name, spec in RANK_SCHEDULE_OPTIMIZER_SPECS.items()
+        })
+        optimizer = optimizer_classes[args.optimizer](param_groups)
+        print(
+            f"INFO: {args.optimizer} optimizer configured. "
+            f"Matrix params: {len(matrix_params)}, auxiliary params: {len(other_params)}."
+        )
+        return optimizer
+
+    if args.optimizer == 'lbfgs':
+        return optim.LBFGS(
             model.parameters(),
             lr=args.lr,
             max_iter=args.lbfgs_max_iter,
             history_size=args.lbfgs_history_size,
         )
-
-    elif args.optimizer == 'adam':
-        print("INFO: Using Adam optimizer.")
-        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.adam_weight_decay)
-
-    else:
-        raise ValueError(f"Unsupported optimizer type: {args.optimizer}")
-
-    return optimizer
+    if args.optimizer == 'adam':
+        return optim.Adam(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.adam_weight_decay,
+        )
+    raise ValueError(f"Unsupported optimizer type: {args.optimizer}")
 
 
 def is_rank_wsd_scheduler(scheduler):
@@ -771,7 +1009,7 @@ def build_scheduler(args, optimizer):
     return scheduler
 
 
-def get_auto_cos_inc_rank_state(optimizer):
+def get_rank_schedule_state(optimizer):
     for group in optimizer.param_groups:
         if group.get('use_muon', False):
             return {
@@ -783,6 +1021,7 @@ def get_auto_cos_inc_rank_state(optimizer):
                 'rank_warmup_steps': group.get('warmup_steps'),
                 'auto_rank_start_final': group.get('auto_rank_start_final'),
                 'current_method': group.get('current_method'),
+                'rank_schedule': group.get('rank_schedule'),
             }
     return {}
 
@@ -956,7 +1195,7 @@ def train_model(args, output_dir):
         if scheduler is not None and not is_rank_wsd_scheduler(scheduler):
             scheduler.step()
 
-        if epoch % args.log_n_epochs == 0:
+        if epoch % args.log_n_epochs == 0 or epoch == args.epochs - 1:
             model.eval()
             with torch.no_grad():
                 if is_super_resolution:
@@ -1021,10 +1260,11 @@ def train_model(args, output_dir):
                 else:
                     log_dict['learning_rate'] = optimizer.param_groups[0]['lr']
 
-                if args.optimizer == AUTO_COS_INC_CANONICAL_NAME:
-                    rank_state = get_auto_cos_inc_rank_state(optimizer)
+                if args.optimizer in RANK_SCHEDULE_OPTIMIZER_NAMES:
+                    rank_state = get_rank_schedule_state(optimizer)
+                    log_dict['rank_schedule/optimizer'] = args.optimizer
                     for key, value in rank_state.items():
-                        log_dict[f'auto_cos_inc/{key}'] = value
+                        log_dict[f'rank_schedule/{key}'] = value
 
                 if rank_wsd_state is not None:
                     log_dict['rank_wsd_phase'] = rank_wsd_state['phase']
@@ -1088,7 +1328,20 @@ def train_model(args, output_dir):
     else:
         original_img = img
 
-    return model, metrics, layer_metrics, log_records, original_img, lpips_model
+    final_rank_state = (
+        get_rank_schedule_state(optimizer)
+        if args.optimizer in RANK_SCHEDULE_OPTIMIZER_NAMES
+        else {}
+    )
+    return (
+        model,
+        metrics,
+        layer_metrics,
+        log_records,
+        original_img,
+        lpips_model,
+        final_rank_state,
+    )
 
 
 def plot_metrics_seaborn_separate(metrics, layer_metrics, args, output_dir):
@@ -1213,9 +1466,30 @@ def main():
     parser.add_argument('--log_n_epochs', default=500, type=int, help='Frequency of logging metrics and images.')
     parser.add_argument('--seed', default=42, type=int, help='Random seed for reproducibility.')
     parser.add_argument('--log_image_evolution', action='store_true', help='Save intermediate image reconstructions to disk.')
+    parser.add_argument('--experiment_name', default='div2k_sisr_rank_schedule_variants', type=str)
+    parser.add_argument('--dataset_split', default='custom', type=str, help='Dataset label stored in CSV outputs.')
+    parser.add_argument('--run_id', default=None, type=str, help='Stable unique identifier used for aggregate-CSV upsert.')
+    parser.add_argument('--output_dir', default=None, type=str, help='Exact directory for this image/run.')
+    parser.add_argument('--results_csv', default=None, type=str, help='Shared row-per-image aggregate CSV.')
+    parser.add_argument('--summary_csv', default=None, type=str, help='Shared mean/std summary CSV.')
+    parser.add_argument('--save_model', action='store_true', help='Save model_weights.pth (disabled by default for large grids).')
+    parser.add_argument('--skip_plots', action='store_true', help='Skip metric plots while retaining CSV outputs.')
 
     # Optimizer arguments
-    parser.add_argument('--optimizer', type=str, default='adam', help='Optimizer to use.')
+    parser.add_argument(
+        '--optimizer',
+        type=str,
+        default='adam',
+        choices=sorted(
+            {'adam', 'muon', 'lbfgs', *LOWRANK_OPTIMIZER_NAMES}
+            | set(RANK_SCHEDULE_OPTIMIZER_ALIASES)
+        ),
+        help=(
+            'Optimizer to use. rank_schedule_variants choices: auto_cos_inc, '
+            'auto_exp_inc, auto_log_inc, auto_linear_inc, auto_logistic_inc, '
+            'auto_cos_dec, and auto_fixed.'
+        ),
+    )
     parser.add_argument('--lr', default=1e-3, type=float, help='Learning rate for Adam, Muon (aux), and L-BFGS (initial step size).')
     parser.add_argument('--adam_weight_decay', type=float, default=0.0, help='Weight decay for pure Adam optimizer.')
 
@@ -1223,16 +1497,16 @@ def main():
     parser.add_argument('--muon_weight_decay', type=float, default=0.0, help='Weight decay for Muon optimizer (hidden weights).')
     parser.add_argument('--muon_aux_weight_decay', type=float, default=0.0, help='Weight decay for auxiliary Adam in Muon.')
     parser.add_argument('--muon_lr', type=float, default=1e-1, help='Learning rate for the Muon part (hidden weights).')
-    parser.add_argument('--muon_momentum', type=float, default=0.95, help='Momentum beta for auto_cos_inc Muon updates.')
-    parser.add_argument('--muon_ns_steps', type=int, default=5, help='Newton-Schulz steps for auto_cos_inc Muon updates.')
-    parser.add_argument('--muon_no_nesterov', action='store_true', help='Disable Nesterov momentum for auto_cos_inc Muon updates.')
+    parser.add_argument('--muon_momentum', type=float, default=0.95, help='Momentum beta for scheduled-rank Muon updates.')
+    parser.add_argument('--muon_ns_steps', type=int, default=10, help='Newton-Schulz steps for scheduled-rank Muon updates.')
+    parser.add_argument('--muon_no_nesterov', action='store_true', help='Disable Nesterov momentum for scheduled-rank Muon updates.')
     parser.add_argument('--optimize_first_layer_with_muon', action='store_true', help='For models with embeddings (FFN, PosEnc), also optimize the first linear layer of the MLP with Muon.')
 
-    # auto_cos_inc_rank.py specific rank-growth arguments
-    parser.add_argument('--rank', type=int, default=200, help='Floor rank used by auto_cos_inc_rank.py.')
+    # rank_schedule_variants arguments
+    parser.add_argument('--rank', type=int, default=200, help='Floor rank used by scheduled-rank optimizers.')
     parser.add_argument('--rank_start', type=int, default=None, help='Initial scheduled rank. Default: --rank.')
-    parser.add_argument('--rank_end', type=int, default=250, help='Final scheduled rank for cosine rank growth.')
-    parser.add_argument('--rank_warmup_steps', type=int, default=None, help='Steps over which rank grows. Default: rank_wsd decay start if scheduler=rank_wsd, otherwise epochs.')
+    parser.add_argument('--rank_end', type=int, default=None, help='Final scheduled rank. Defaults depend on the selected variant.')
+    parser.add_argument('--rank_warmup_steps', type=int, default=None, help='Steps over which rank changes. Default: rank_wsd decay start.')
     parser.add_argument('--rank_oversample', type=int, default=4, help='Randomized low-rank oversampling dimension.')
     parser.add_argument('--lowrank_rescale', action='store_true', help='Enable low-rank update rescaling in auto_cos_inc_rank.py.')
     parser.add_argument('--lowrank_eps', type=float, default=1e-6, help='Numerical epsilon for low-rank Muon update.')
@@ -1241,6 +1515,9 @@ def main():
     parser.add_argument('--init_probe_steps', type=int, default=8, help='Number of early steps for auto rank_start estimation.')
     parser.add_argument('--init_energy', type=float, default=0.90, help='Energy threshold for auto rank_start estimation.')
     parser.add_argument('--init_round_multiple', type=int, default=8, help='Round auto-estimated rank_start up to this multiple.')
+    parser.add_argument('--exp_rate', type=float, default=5.0, help='Curvature for exponential rank increase.')
+    parser.add_argument('--log_rate', type=float, default=9.0, help='Curvature for logarithmic rank increase.')
+    parser.add_argument('--logistic_steepness', type=float, default=12.0, help='Steepness for logistic rank increase.')
     parser.add_argument('--muon_delta', type=float, default=None,
                     help='If set, project (clip) Muon update ΔW to operator-norm ball of radius delta.')
     parser.add_argument('--muon_op_clip_mode', type=str, default='matrix',
@@ -1296,14 +1573,16 @@ def main():
     parser.add_argument('--sr_train_chunk_size', default=65536, type=int, help='Chunk size for LR training forward/backward in SISR. Use <=0 to disable.')
     parser.add_argument('--sr_eval_chunk_size', default=262144, type=int, help='Chunk size for HR evaluation in SISR. Use <=0 to disable.')
 
-    # output folder naming
+    # Legacy output-root argument retained for older commands.
     parser.add_argument('--folder_name', default=None, type=str)
 
     args = parser.parse_args()
     args.optimizer = normalize_optimizer_name(args.optimizer)
     if args.scheduler == 'rank-wsd':
         args.scheduler = 'rank_wsd'
-    resolve_auto_cos_inc_rank_args(args)
+    if args.rank_wsd_decay_start_step is None:
+        args.rank_wsd_decay_start_step = max(1, int(round(0.8 * args.epochs)))
+    resolve_rank_schedule_args(args)
     set_seed(args.seed)
 
     # Parse model-specific parameters that can be lists
@@ -1317,12 +1596,24 @@ def main():
         raise ValueError("inpainting_ratio must be between 0.0 and 1.0.")
     if args.scale_factor < 1:
         raise ValueError('scale_factor must be >= 1.')
+    if args.epochs < 1 or args.log_n_epochs < 1:
+        raise ValueError('--epochs and --log_n_epochs must be >= 1.')
+    if not (0.0 < args.rank_wsd_min_lr_ratio <= 1.0):
+        raise ValueError('--rank_wsd_min_lr_ratio must be in (0, 1].')
 
     output_dir = get_output_dir(args)
     save_args(args, output_dir)
     print(f"Results will be saved to: {output_dir}")
 
-    model, metrics, layer_metrics, log_records, original_img, lpips_model = train_model(args, output_dir)
+    (
+        model,
+        metrics,
+        layer_metrics,
+        log_records,
+        original_img,
+        lpips_model,
+        final_rank_state,
+    ) = train_model(args, output_dir)
 
     # Final evaluation and logging
     model.eval()
@@ -1351,29 +1642,27 @@ def main():
         final_comparison_fig.savefig(os.path.join(output_dir, 'final_comparison.png'), bbox_inches='tight')
         plt.close(final_comparison_fig)
         save_image(np.clip(final_pred.numpy(), 0, 1), os.path.join(output_dir, 'final_reconstruction.png'))
-        torch.save(model.state_dict(), os.path.join(output_dir, 'model_weights.pth'))
+        save_image(np.clip(final_pred.numpy(), 0, 1), os.path.join(output_dir, 'predicted_image.png'))
+        if args.save_model:
+            torch.save(model.state_dict(), os.path.join(output_dir, 'model_weights.pth'))
         save_readme(output_dir, final_psnr, final_ssim, final_lpips)
 
     save_metrics_csv(metrics, layer_metrics, log_records, output_dir)
-    plot_metrics_seaborn_separate(metrics, layer_metrics, args, output_dir)
+    result_row = build_result_row(
+        args,
+        output_dir,
+        {
+            'final_psnr': final_psnr,
+            'final_ssim': final_ssim,
+            'final_lpips': final_lpips,
+        },
+        final_rank_state,
+    )
+    save_final_results(args, output_dir, result_row)
+    if not args.skip_plots:
+        plot_metrics_seaborn_separate(metrics, layer_metrics, args, output_dir)
     print(f"Training finished and results saved to {output_dir}.")
 
 
 if __name__ == "__main__":
     main()
-
-"""
-python sisr_auto_cos_inc_rank_wsd.py \
-  --task super_resolution \
-  --optimizer auto_cos_inc \
-  --scheduler rank_wsd \
-  --epochs 5000 \
-  --rank 64 \
-  --rank_start 64 \
-  --rank_end 256 \
-  --rank_warmup_steps 4000 \
-  --rank_wsd_decay_start_step 4000 \
-  --rank_wsd_min_lr_ratio 0.1 \
-  --muon_lr 1e-1 \
-  --lr 1e-3
-"""

@@ -449,7 +449,7 @@ class SingleDeviceAutoScheduledRankWithAuxAdam(torch.optim.Optimizer):
                 g.setdefault("lr", 0.003)
                 g.setdefault("momentum", 0.95)
                 g.setdefault("weight_decay", 0.0)
-                g.setdefault("ns_steps", 10)
+                g.setdefault("ns_steps", 5)
                 g.setdefault("nesterov", True)
                 g.setdefault("rank", self.DEFAULT_RANK)
                 g.setdefault("rank_start", self.DEFAULT_RANK_START)
