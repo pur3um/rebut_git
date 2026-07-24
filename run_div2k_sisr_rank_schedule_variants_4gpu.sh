@@ -7,6 +7,10 @@ set -Eeuo pipefail
 # - Uses physical GPUs 0,1,2,3 by default.
 # - Runs one experiment at a time on each GPU.
 # - Covers both DIV2K_train_HR and DIV2K_valid_HR.
+# - Cycles ReLU MLP, SIREN, real-valued WIRE, and FINER by default.
+# - Uses model-specific Adam/auxiliary learning rates:
+#     ReLU=1e-3, SIREN=1e-3, real WIRE=3e-2, FINER=3e-4.
+# - Cycles Muon learning rates 2e-3 and 3e-3 by default.
 # - Cycles all seven optimizers in rank_schedule_variants with rank_wsd.
 # - A repeated command resumes from .done markers.
 #
@@ -20,6 +24,14 @@ set -Eeuo pipefail
 # Several starting ranks:
 #   RANK_STARTS="32 64 128" \
 #       bash run_div2k_sisr_rank_schedule_variants_4gpu.sh
+#
+# Selected models only:
+#   MODELS="siren_mlp real_wire finer_mlp" \
+#       bash run_div2k_sisr_rank_schedule_variants_4gpu.sh
+#
+# A single Muon learning rate only:
+#   MUON_LR="3e-3" \
+#       bash run_div2k_sisr_rank_schedule_variants_4gpu.sh
 # ============================================================================
 
 # ---------------------------------------------------------------------------
@@ -27,8 +39,8 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 BASE_PATH=${BASE_PATH:-/workspace/rebut_git}
 FIT_SISR=${FIT_SISR:-"${BASE_PATH}/fit_sisr_rebut.py"}
-TRAIN_ROOT=${TRAIN_ROOT:-/workspace/rebut_git/data/div2k/DIV2K_train_HR}
-VALID_ROOT=${VALID_ROOT:-/workspace/rebut_git/data/div2k/DIV2K_valid_HR}
+TRAIN_ROOT=${TRAIN_ROOT:-"${BASE_PATH}/data/div2k/DIV2K_train_HR"}
+VALID_ROOT=${VALID_ROOT:-"${BASE_PATH}/data/div2k/DIV2K_valid_HR"}
 OUT_ROOT=${OUT_ROOT:-"${BASE_PATH}/results/div2k_sisr_rank_schedule_variants"}
 PYTHON_BIN=${PYTHON_BIN:-python}
 
@@ -68,9 +80,20 @@ RANK_WSD_DECAY_START_STEP=${RANK_WSD_DECAY_START_STEP:-auto}
 RANK_WSD_DECAY_START_RATIO=${RANK_WSD_DECAY_START_RATIO:-${RANK_WARMUP_RATIO}}
 RANK_WSD_MIN_LR_RATIO=${RANK_WSD_MIN_LR_RATIO:-0.1}
 
-# SISR defaults from fit_sisr_rebut.py.
+# Model-specific Adam/auxiliary learning rates. LR remains the fallback and
+# the backward-compatible override for ReLU or any newly added model.
 LR=${LR:-1e-3}
-MUON_LR=${MUON_LR:-1e-1}
+RELU_LR=${RELU_LR:-${LR}}
+SIREN_LR=${SIREN_LR:-1e-3}
+WIRE_LR=${WIRE_LR:-0.03}
+FINER_LR=${FINER_LR:-3e-4}
+
+# MUON_LRS defines a grid. For backward compatibility, setting MUON_LR without
+# MUON_LRS runs only that single value.
+MUON_LRS=${MUON_LRS:-}
+if [[ -z "${MUON_LRS}" ]]; then
+    MUON_LRS=${MUON_LR:-"2e-3 3e-3"}
+fi
 MUON_MOMENTUM=${MUON_MOMENTUM:-0.95}
 MUON_NS_STEPS=${MUON_NS_STEPS:-5}
 EXP_RATE=${EXP_RATE:-5.0}
@@ -78,7 +101,12 @@ LOG_RATE=${LOG_RATE:-9.0}
 LOGISTIC_STEEPNESS=${LOGISTIC_STEEPNESS:-12.0}
 LOG_N_EPOCHS=${LOG_N_EPOCHS:-500}
 
-MODEL=${MODEL:-relu_mlp}
+# MODELS controls the model grid. MODEL remains a backward-compatible
+# single-model override when MODELS is not explicitly provided.
+MODELS=${MODELS:-}
+if [[ -z "${MODELS}" ]]; then
+    MODELS=${MODEL:-"relu_mlp siren_mlp real_wire finer_mlp"}
+fi
 NUM_LAYERS=${NUM_LAYERS:-5}
 HIDDEN_DIM=${HIDDEN_DIM:-300}
 SR_TRAIN_CHUNK_SIZE=${SR_TRAIN_CHUNK_SIZE:-65536}
@@ -99,10 +127,12 @@ EXTRA_ARGS=${EXTRA_ARGS:-}
 
 read -r -a gpu_array <<< "${GPU_IDS}"
 read -r -a dataset_array <<< "${DATASETS}"
+read -r -a model_array <<< "${MODELS}"
 read -r -a optimizer_array <<< "${OPTIMIZERS}"
 read -r -a epoch_array <<< "${EPOCHS}"
 read -r -a scale_array <<< "${SCALE_FACTORS}"
 read -r -a seed_array <<< "${SEEDS}"
+read -r -a muon_lr_array <<< "${MUON_LRS}"
 read -r -a rank_start_array <<< "${RANK_STARTS}"
 read -r -a rank_end_array <<< "${RANK_ENDS}"
 read -r -a fixed_rank_array <<< "${FIXED_RANKS}"
@@ -134,6 +164,17 @@ canonical_optimizer() {
         auto-cos-dec|auto_cos_dec_rank|cosine_dec)       printf '%s' auto_cos_dec ;;
         auto-fixed|auto_fixed_rank|fixed_rank)            printf '%s' auto_fixed ;;
         *)                                                printf '%s' "$1" ;;
+    esac
+}
+
+learning_rate_for_model() {
+    case "$1" in
+        relu_mlp)  printf '%s' "${RELU_LR}" ;;
+        siren_mlp) printf '%s' "${SIREN_LR}" ;;
+        wire_mlp|real_wire)
+                   printf '%s' "${WIRE_LR}" ;;
+        finer_mlp) printf '%s' "${FINER_LR}" ;;
+        *)         printf '%s' "${LR}" ;;
     esac
 }
 
@@ -282,6 +323,19 @@ if (( ${#gpu_array[@]} == 0 )); then
     echo "[ERROR] GPU_IDS must contain at least one physical GPU index." >&2
     exit 2
 fi
+if (( ${#model_array[@]} == 0 )); then
+    echo "[ERROR] MODELS must contain at least one model name." >&2
+    exit 2
+fi
+for model in "${model_array[@]}"; do
+    case "${model}" in
+        relu_mlp|siren_mlp|wire_mlp|real_wire|finer_mlp) ;;
+        *)
+            echo "[ERROR] Unsupported model '${model}'. Use relu_mlp, siren_mlp, wire_mlp, real_wire, and/or finer_mlp." >&2
+            exit 2
+            ;;
+    esac
+done
 for gpu_id in "${gpu_array[@]}"; do
     if [[ ! "${gpu_id}" =~ ^[0-9]+$ ]]; then
         echo "[ERROR] Invalid GPU index '${gpu_id}' in GPU_IDS." >&2
@@ -296,6 +350,17 @@ if ! is_positive_integer "${MUON_NS_STEPS}"; then
     echo "[ERROR] MUON_NS_STEPS must be a positive integer." >&2
     exit 2
 fi
+if (( ${#muon_lr_array[@]} == 0 )); then
+    echo "[ERROR] MUON_LRS must contain at least one learning rate." >&2
+    exit 2
+fi
+for value in "${RELU_LR}" "${SIREN_LR}" "${WIRE_LR}" "${FINER_LR}" \
+             "${muon_lr_array[@]}"; do
+    if ! awk -v value="${value}" 'BEGIN { exit !(value > 0.0) }'; then
+        echo "[ERROR] Learning rates must be positive numbers; got '${value}'." >&2
+        exit 2
+    fi
+done
 
 for value in "${epoch_array[@]}" "${scale_array[@]}" "${seed_array[@]}" \
              "${rank_start_array[@]}" "${rank_end_array[@]}" "${fixed_rank_array[@]}"; do
@@ -335,7 +400,7 @@ exec 9>>"${STATUS_FILE}"
 # ---------------------------------------------------------------------------
 # Build a deterministic manifest covering both dataset splits
 # ---------------------------------------------------------------------------
-printf 'job_id\tdataset_split\timage_path\toptimizer\trank_floor\trank_start\trank_end\tepochs\tscale_factor\tseed\trank_warmup_steps\tdecay_start_step\tcondition\trun_id\trun_dir\n' \
+printf 'job_id\tdataset_split\timage_path\tmodel\toptimizer\trank_floor\trank_start\trank_end\tepochs\tscale_factor\tseed\tlr\tmuon_lr\trank_warmup_steps\tdecay_start_step\tcondition\trun_id\trun_dir\n' \
     > "${MANIFEST_FILE}"
 
 job_count=0
@@ -353,59 +418,65 @@ for dataset_split in "${dataset_array[@]}"; do
         exit 2
     fi
 
-    for optimizer_label in "${optimizer_array[@]}"; do
-        optimizer=$(canonical_optimizer "${optimizer_label}")
-        case "${optimizer}" in
-            auto_cos_inc|auto_exp_inc|auto_log_inc|auto_linear_inc|auto_logistic_inc|auto_cos_dec|auto_fixed) ;;
-            *)
-                echo "[ERROR] Unsupported rank_schedule_variants optimizer: ${optimizer_label}" >&2
-                exit 2
-                ;;
-        esac
+    for model in "${model_array[@]}"; do
+        model_lr=$(learning_rate_for_model "${model}")
+        for optimizer_label in "${optimizer_array[@]}"; do
+            optimizer=$(canonical_optimizer "${optimizer_label}")
+            case "${optimizer}" in
+                auto_cos_inc|auto_exp_inc|auto_log_inc|auto_linear_inc|auto_logistic_inc|auto_cos_dec|auto_fixed) ;;
+                *)
+                    echo "[ERROR] Unsupported rank_schedule_variants optimizer: ${optimizer_label}" >&2
+                    exit 2
+                    ;;
+            esac
 
-        mapfile -t rank_configs < <(rank_configurations_for_optimizer "${optimizer}")
-        for rank_config in "${rank_configs[@]}"; do
-            IFS=$'\t' read -r rank_floor rank_start rank_end <<< "${rank_config}"
+            mapfile -t rank_configs < <(rank_configurations_for_optimizer "${optimizer}")
+            for rank_config in "${rank_configs[@]}"; do
+                IFS=$'\t' read -r rank_floor rank_start rank_end <<< "${rank_config}"
 
-            for epochs in "${epoch_array[@]}"; do
-                rank_warmup_steps=$(
-                    resolve_scaled_step \
-                        "${RANK_WARMUP_STEPS}" "${RANK_WARMUP_RATIO}" \
-                        "${epochs}" RANK_WARMUP_STEPS
-                )
-                decay_start_step=$(
-                    resolve_scaled_step \
-                        "${RANK_WSD_DECAY_START_STEP}" "${RANK_WSD_DECAY_START_RATIO}" \
-                        "${epochs}" RANK_WSD_DECAY_START_STEP
-                )
+                for epochs in "${epoch_array[@]}"; do
+                    rank_warmup_steps=$(
+                        resolve_scaled_step \
+                            "${RANK_WARMUP_STEPS}" "${RANK_WARMUP_RATIO}" \
+                            "${epochs}" RANK_WARMUP_STEPS
+                    )
+                    decay_start_step=$(
+                        resolve_scaled_step \
+                            "${RANK_WSD_DECAY_START_STEP}" "${RANK_WSD_DECAY_START_RATIO}" \
+                            "${epochs}" RANK_WSD_DECAY_START_STEP
+                    )
 
-                for scale_factor in "${scale_array[@]}"; do
-                    for seed in "${seed_array[@]}"; do
-                        condition=$(
-                            printf 'model-%s-L%s-H%s__opt-%s-shape-%s__sched-rank_wsd__x%s__rf%s-rs%s-re%s__rw%s-ds%s-min%s__ep%s__lr%s-mlr%s-mom%s-ns%s__seed%s' \
-                                "$(safe_tag "${MODEL}")" "${NUM_LAYERS}" "${HIDDEN_DIM}" \
-                                "$(safe_tag "${optimizer}")" "$(optimizer_shape_tag "${optimizer}")" \
-                                "${scale_factor}" \
-                                "${rank_floor}" "${rank_start}" "${rank_end}" \
-                                "${rank_warmup_steps}" "${decay_start_step}" \
-                                "$(safe_tag "${RANK_WSD_MIN_LR_RATIO}")" "${epochs}" \
-                                "$(safe_tag "${LR}")" "$(safe_tag "${MUON_LR}")" \
-                                "$(safe_tag "${MUON_MOMENTUM}")" "${MUON_NS_STEPS}" "${seed}"
-                        )
+                    for scale_factor in "${scale_array[@]}"; do
+                        for seed in "${seed_array[@]}"; do
+                            for muon_lr in "${muon_lr_array[@]}"; do
+                                condition=$(
+                                    printf 'model-%s-L%s-H%s__opt-%s-shape-%s__sched-rank_wsd__x%s__rf%s-rs%s-re%s__rw%s-ds%s-min%s__ep%s__lr%s-mlr%s-mom%s-ns%s__seed%s' \
+                                        "$(safe_tag "${model}")" "${NUM_LAYERS}" "${HIDDEN_DIM}" \
+                                        "$(safe_tag "${optimizer}")" "$(optimizer_shape_tag "${optimizer}")" \
+                                        "${scale_factor}" \
+                                        "${rank_floor}" "${rank_start}" "${rank_end}" \
+                                        "${rank_warmup_steps}" "${decay_start_step}" \
+                                        "$(safe_tag "${RANK_WSD_MIN_LR_RATIO}")" "${epochs}" \
+                                        "$(safe_tag "${model_lr}")" "$(safe_tag "${muon_lr}")" \
+                                        "$(safe_tag "${MUON_MOMENTUM}")" "${MUON_NS_STEPS}" "${seed}"
+                                )
 
-                        for image_path in "${images[@]}"; do
-                            image_file=$(basename "${image_path}")
-                            image_stem=${image_file%.*}
-                            run_id="${EXPERIMENT_NAME}__${dataset_split}__${condition}__img-${image_stem}"
-                            run_dir="${OUT_ROOT}/runs/${dataset_split}/${condition}/${image_stem}"
-                            job_count=$((job_count + 1))
+                                for image_path in "${images[@]}"; do
+                                    image_file=$(basename "${image_path}")
+                                    image_stem=${image_file%.*}
+                                    run_id="${EXPERIMENT_NAME}__${dataset_split}__${condition}__img-${image_stem}"
+                                    run_dir="${OUT_ROOT}/runs/${dataset_split}/${condition}/${image_stem}"
+                                    job_count=$((job_count + 1))
 
-                            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-                                "${job_count}" "${dataset_split}" "${image_path}" "${optimizer}" \
-                                "${rank_floor}" "${rank_start}" "${rank_end}" "${epochs}" \
-                                "${scale_factor}" "${seed}" "${rank_warmup_steps}" \
-                                "${decay_start_step}" "${condition}" "${run_id}" "${run_dir}" \
-                                >> "${MANIFEST_FILE}"
+                                    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                                        "${job_count}" "${dataset_split}" "${image_path}" "${model}" "${optimizer}" \
+                                        "${rank_floor}" "${rank_start}" "${rank_end}" "${epochs}" \
+                                        "${scale_factor}" "${seed}" "${model_lr}" "${muon_lr}" \
+                                        "${rank_warmup_steps}" "${decay_start_step}" \
+                                        "${condition}" "${run_id}" "${run_dir}" \
+                                        >> "${MANIFEST_FILE}"
+                                done
+                            done
                         done
                     done
                 done
@@ -424,6 +495,9 @@ echo "[INFO] Train data: ${TRAIN_ROOT}"
 echo "[INFO] Valid data: ${VALID_ROOT}"
 echo "[INFO] Output    : ${OUT_ROOT}"
 echo "[INFO] GPUs      : ${GPU_IDS} (one sequential worker per GPU)"
+echo "[INFO] Models    : ${MODELS}"
+echo "[INFO] Muon LRs  : ${MUON_LRS}"
+echo "[INFO] Model LRs : ReLU=${RELU_LR}, SIREN=${SIREN_LR}, WIRE=${WIRE_LR}, FINER=${FINER_LR}"
 echo "[INFO] Jobs      : ${job_count}"
 echo "[INFO] Manifest  : ${MANIFEST_FILE}"
 echo "[INFO] Results   : ${RESULTS_CSV}"
@@ -440,8 +514,8 @@ run_worker() {
     local worker_failed=0
     local worker_skipped=0
 
-    while IFS=$'\t' read -r job_id dataset_split image_path optimizer \
-        rank_floor rank_start rank_end epochs scale_factor seed \
+    while IFS=$'\t' read -r job_id dataset_split image_path model optimizer \
+        rank_floor rank_start rank_end epochs scale_factor seed lr muon_lr \
         rank_warmup_steps decay_start_step condition run_id run_dir; do
 
         if [[ "${job_id}" == job_id ]]; then
@@ -480,8 +554,8 @@ run_worker() {
             --rank_wsd_warmup_steps "${RANK_WSD_WARMUP_STEPS}"
             --rank_wsd_decay_start_step "${decay_start_step}"
             --rank_wsd_min_lr_ratio "${RANK_WSD_MIN_LR_RATIO}"
-            --lr "${LR}"
-            --muon_lr "${MUON_LR}"
+            --lr "${lr}"
+            --muon_lr "${muon_lr}"
             --muon_momentum "${MUON_MOMENTUM}"
             --muon_ns_steps "${MUON_NS_STEPS}"
             --exp_rate "${EXP_RATE}"
@@ -489,7 +563,7 @@ run_worker() {
             --logistic_steepness "${LOGISTIC_STEEPNESS}"
             --log_n_epochs "${LOG_N_EPOCHS}"
             --seed "${seed}"
-            --model "${MODEL}"
+            --model "${model}"
             --num_layers "${NUM_LAYERS}"
             --hidden_dim "${HIDDEN_DIM}"
             --sr_train_chunk_size "${SR_TRAIN_CHUNK_SIZE}"
