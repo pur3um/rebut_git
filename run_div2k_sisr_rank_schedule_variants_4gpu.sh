@@ -246,9 +246,18 @@ rank_configurations_for_optimizer() {
     done
 }
 
+# dataset_root() {
+#     case "$1" in
+#         train) printf '%s' "${TRAIN_ROOT}" ;;
+#         valid) printf '%s' "${VALID_ROOT}" ;;
+#         *)
+#             echo "[ERROR] Unknown DATASETS label '$1'. Use train and/or valid." >&2
+#             return 2
+#             ;;
+#     esac
+# }
 dataset_root() {
     case "$1" in
-        train) printf '%s' "${TRAIN_ROOT}" ;;
         valid) printf '%s' "${VALID_ROOT}" ;;
         *)
             echo "[ERROR] Unknown DATASETS label '$1'. Use train and/or valid." >&2
