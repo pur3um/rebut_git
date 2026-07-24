@@ -252,6 +252,7 @@ def make_run_id(args):
         args.model,
         args.optimizer,
         args.scheduler,
+        args.scheduler_variant,
         f'rf{args.rank}',
         f'rs{args.rank_start}',
         f're{args.rank_end}',
@@ -275,6 +276,7 @@ def _write_condition_summary(results_df, summary_csv):
         'rank_schedule',
         'rank_direction',
         'scheduler',
+        'scheduler_variant',
         'epochs',
         'seed',
         'rank_floor',
@@ -354,6 +356,7 @@ def upsert_aggregate_results(result_row, results_csv, summary_csv):
 
 def build_result_row(args, output_dir, final_metrics, final_rank_state):
     image_path = os.path.abspath(args.image)
+    uses_rank_wsd = args.scheduler == 'rank_wsd'
     return {
         'run_id': make_run_id(args),
         'timestamp_utc': datetime.now(timezone.utc).isoformat(),
@@ -372,6 +375,7 @@ def build_result_row(args, output_dir, final_metrics, final_rank_state):
         'rank_schedule': getattr(args, 'rank_schedule', None),
         'rank_direction': getattr(args, 'rank_direction', None),
         'scheduler': args.scheduler,
+        'scheduler_variant': args.scheduler_variant,
         'lr_aux': args.lr,
         'lr_muon': args.muon_lr,
         'muon_momentum': args.muon_momentum,
@@ -382,9 +386,9 @@ def build_result_row(args, output_dir, final_metrics, final_rank_state):
         'rank_warmup_steps': args.rank_warmup_steps,
         'final_applied_rank': final_rank_state.get('current_rank'),
         'final_target_rank': final_rank_state.get('current_target_rank'),
-        'rank_wsd_warmup_steps': args.rank_wsd_warmup_steps,
-        'rank_wsd_decay_start_step': args.rank_wsd_decay_start_step,
-        'rank_wsd_min_lr_ratio': args.rank_wsd_min_lr_ratio,
+        'rank_wsd_warmup_steps': args.rank_wsd_warmup_steps if uses_rank_wsd else None,
+        'rank_wsd_decay_start_step': args.rank_wsd_decay_start_step if uses_rank_wsd else None,
+        'rank_wsd_min_lr_ratio': args.rank_wsd_min_lr_ratio if uses_rank_wsd else None,
         'exp_rate': args.exp_rate,
         'log_rate': args.log_rate,
         'logistic_steepness': args.logistic_steepness,
@@ -402,6 +406,19 @@ def save_final_results(args, output_dir, result_row):
         os.path.join(output_dir, 'final_result.csv'),
     )
     upsert_aggregate_results(result_row, args.results_csv, args.summary_csv)
+    if args.variant_results_csv is not None:
+        main_results = (
+            os.path.abspath(args.results_csv)
+            if args.results_csv is not None
+            else None
+        )
+        variant_results = os.path.abspath(args.variant_results_csv)
+        if variant_results != main_results:
+            upsert_aggregate_results(
+                result_row,
+                variant_results,
+                args.variant_summary_csv,
+            )
 
 
 def modcrop(img, scale):
@@ -978,6 +995,12 @@ def build_scheduler(args, optimizer):
         scheduler = StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
         print(f"Using StepLR scheduler with step_size={args.step_size} and gamma={args.gamma}")
     elif args.scheduler == 'rank_wsd':
+        if args.optimizer != 'auto_cos_inc':
+            raise ValueError(
+                "--scheduler rank_wsd is allowed only with "
+                "--optimizer auto_cos_inc. Muon and every other optimizer "
+                "must use none, cosine, or step."
+            )
         if RankAwareWarmupStableLinearScheduler is None:
             raise ImportError(
                 "--scheduler rank_wsd requires rank_wsd_schedulers.py either in the same directory "
@@ -998,11 +1021,6 @@ def build_scheduler(args, optimizer):
         )
         print(scheduler.describe())
 
-        if args.optimizer not in LOWRANK_LIKE_OPTIMIZERS:
-            print(
-                "WARNING: rank_wsd is intended for Muon/lowrank-style optimizers. "
-                "For this optimizer it will schedule LR only unless the optimizer exposes N_rand/n_rand."
-            )
     else:
         raise ValueError(f"Unsupported scheduler type: {args.scheduler}")
 
@@ -1472,6 +1490,8 @@ def main():
     parser.add_argument('--output_dir', default=None, type=str, help='Exact directory for this image/run.')
     parser.add_argument('--results_csv', default=None, type=str, help='Shared row-per-image aggregate CSV.')
     parser.add_argument('--summary_csv', default=None, type=str, help='Shared mean/std summary CSV.')
+    parser.add_argument('--variant_results_csv', default=None, type=str, help='Scheduler-variant-specific aggregate CSV.')
+    parser.add_argument('--variant_summary_csv', default=None, type=str, help='Scheduler-variant-specific mean/std summary CSV.')
     parser.add_argument('--save_model', action='store_true', help='Save model_weights.pth (disabled by default for large grids).')
     parser.add_argument('--skip_plots', action='store_true', help='Skip metric plots while retaining CSV outputs.')
 
@@ -1580,6 +1600,14 @@ def main():
     args.optimizer = normalize_optimizer_name(args.optimizer)
     if args.scheduler == 'rank-wsd':
         args.scheduler = 'rank_wsd'
+    if args.scheduler == 'rank_wsd' and args.optimizer != 'auto_cos_inc':
+        raise ValueError(
+            "--scheduler rank_wsd is allowed only with "
+            "--optimizer auto_cos_inc. In particular, it is forbidden for muon."
+        )
+    args.scheduler_variant = (
+        'rank_wsd' if args.scheduler == 'rank_wsd' else 'standard'
+    )
     if args.rank_wsd_decay_start_step is None:
         args.rank_wsd_decay_start_step = max(1, int(round(0.8 * args.epochs)))
     resolve_rank_schedule_args(args)
