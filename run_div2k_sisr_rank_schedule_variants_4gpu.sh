@@ -25,10 +25,10 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Repository, data, and output paths
 # ---------------------------------------------------------------------------
-BASE_PATH=${BASE_PATH:-/home/greenx9/data/cnfr/pp_rebuttal/rebut_git}
+BASE_PATH=${BASE_PATH:-/workspace/rebut_git}
 FIT_SISR=${FIT_SISR:-"${BASE_PATH}/fit_sisr_rebut.py"}
-TRAIN_ROOT=${TRAIN_ROOT:-/home/greenx9/data/cnfr/pp_rebuttal/rebut_git/data/div2k/DIV2K_train_HR}
-VALID_ROOT=${VALID_ROOT:-/home/greenx9/data/cnfr/pp_rebuttal/rebut_git/data/div2k/DIV2K_valid_HR}
+TRAIN_ROOT=${TRAIN_ROOT:-/workspace/rebut_git/data/div2k/DIV2K_train_HR}
+VALID_ROOT=${VALID_ROOT:-/workspace/rebut_git/data/div2k/DIV2K_valid_HR}
 OUT_ROOT=${OUT_ROOT:-"${BASE_PATH}/results/div2k_sisr_rank_schedule_variants"}
 PYTHON_BIN=${PYTHON_BIN:-python}
 
