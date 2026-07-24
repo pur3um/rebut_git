@@ -6,7 +6,7 @@ set -Eeuo pipefail
 #
 # - Uses physical GPUs 0,1,2,3 by default.
 # - Runs one experiment at a time on each GPU.
-# - Covers DIV2K_valid_HR only (DIV2K_train_HR is excluded).
+# - Covers both DIV2K_train_HR and DIV2K_valid_HR.
 # - Cycles ReLU MLP, SIREN, real-valued WIRE, and FINER by default.
 # - Uses model-specific Adam/auxiliary learning rates:
 #     ReLU=1e-3, SIREN=1e-3, real WIRE=3e-2, FINER=3e-4.
@@ -39,6 +39,7 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 BASE_PATH=${BASE_PATH:-/workspace/rebut_git}
 FIT_SISR=${FIT_SISR:-"${BASE_PATH}/fit_sisr_rebut.py"}
+TRAIN_ROOT=${TRAIN_ROOT:-"${BASE_PATH}/data/div2k/DIV2K_train_HR"}
 VALID_ROOT=${VALID_ROOT:-"${BASE_PATH}/data/div2k/DIV2K_valid_HR"}
 OUT_ROOT=${OUT_ROOT:-"${BASE_PATH}/results/div2k_sisr_rank_schedule_variants"}
 PYTHON_BIN=${PYTHON_BIN:-python}
@@ -57,7 +58,7 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 # Experiment grid
 # ---------------------------------------------------------------------------
 GPU_IDS=${GPU_IDS:-"0 1 2 3"}
-DATASETS=${DATASETS:-"valid"}
+DATASETS=${DATASETS:-"train valid"}
 OPTIMIZERS=${OPTIMIZERS:-"auto_cos_inc auto_exp_inc auto_log_inc auto_linear_inc auto_logistic_inc auto_cos_dec auto_fixed"}
 SCHEDULER=${SCHEDULER:-rank_wsd}
 EPOCHS=${EPOCHS:-"2000 3000"}
@@ -247,9 +248,10 @@ rank_configurations_for_optimizer() {
 
 dataset_root() {
     case "$1" in
+        train) printf '%s' "${TRAIN_ROOT}" ;;
         valid) printf '%s' "${VALID_ROOT}" ;;
         *)
-            echo "[ERROR] Unknown DATASETS label '$1'. Use valid." >&2
+            echo "[ERROR] Unknown DATASETS label '$1'. Use train and/or valid." >&2
             return 2
             ;;
     esac
@@ -396,7 +398,7 @@ printf 'timestamp\tstatus\tgpu_id\tjob_id\trun_id\texit_code\trun_dir\n' > "${ST
 exec 9>>"${STATUS_FILE}"
 
 # ---------------------------------------------------------------------------
-# Build a deterministic manifest covering the valid split only
+# Build a deterministic manifest covering both dataset splits
 # ---------------------------------------------------------------------------
 printf 'job_id\tdataset_split\timage_path\tmodel\toptimizer\trank_floor\trank_start\trank_end\tepochs\tscale_factor\tseed\tlr\tmuon_lr\trank_warmup_steps\tdecay_start_step\tcondition\trun_id\trun_dir\n' \
     > "${MANIFEST_FILE}"
@@ -489,6 +491,7 @@ if (( job_count == 0 )); then
 fi
 
 echo "[INFO] Base path : ${BASE_PATH}"
+echo "[INFO] Train data: ${TRAIN_ROOT}"
 echo "[INFO] Valid data: ${VALID_ROOT}"
 echo "[INFO] Output    : ${OUT_ROOT}"
 echo "[INFO] GPUs      : ${GPU_IDS} (one sequential worker per GPU)"
